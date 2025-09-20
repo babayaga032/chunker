@@ -1,8 +1,11 @@
 fastapi
 uvicorn
-openai==1.*
+openai
 supabase
 tiktoken
-PyMuPDF
+pymupdf
 python-docx
 pandas
+requests
+slugify
+python-multipart   # 👈 this is the missing one
