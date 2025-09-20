@@ -159,11 +159,19 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
                 "embedding": emb.embedding,
                 "metadata": metadata,
             })
-
         # 6. Insert into Supabase
-        supabase.table("mcv4u_documents").upsert(rows, on_conflict="unique_id").execute()
-
-        return {"status": "success", "inserted": len(rows), "content_type": content_type}
+        try:
+            res = supabase.table("mcv4u_documents").upsert(
+                rows, on_conflict="unique_id"
+            ).execute()
+            return {"status": "success", "inserted": len(rows), "content_type": content_type, "response": res.data}
+        except Exception as db_err:
+            import traceback
+            return JSONResponse({
+                "status": "error",
+                "msg": str(db_err),
+                "trace": traceback.format_exc()
+            }, status_code=500)
 
     except Exception as e:
         return JSONResponse({"status":"error","msg":str(e)}, status_code=500)
