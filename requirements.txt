@@ -8,4 +8,5 @@ python-docx
 pandas
 requests
 slugify
-python-multipart   # 👈 this is the missing one
+python-multipart
+langchain-google-genai
