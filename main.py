@@ -169,9 +169,8 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
         # 6. Build rows
         rows = []
         for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            # digest = sha1_hex(chunk)
-            # unique_id = f"{file.filename}__{i}__{digest[:8]}"
-            unique_id = file.filename # Use full filename as unique ID
+            digest = sha1_hex(chunk)
+            unique_id = f"{file.filename}__{i}__{digest[:8]}"
             metadata = {
                 "file_name": file.filename,
                 "course_code": course_code,
