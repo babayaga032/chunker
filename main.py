@@ -8,24 +8,29 @@ import os, io, re, uuid, hashlib
 import fitz  # PyMuPDF for PDF
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
-from openai import OpenAI
 from supabase import create_client
 import tiktoken
 from docx import Document as DocxDocument
 import pandas as pd
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # -------------------------------------------------------------------
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_KEY   = os.getenv("OPENAI_API_KEY")
-
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-client   = OpenAI(api_key=OPENAI_KEY)
+gemini_client = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
+gemini_chat_client = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY)
 
-EMBED_MODEL = "text-embedding-3-small"  # 1536 dimensions
-CHUNK_SIZE  = 800
-CHUNK_OVERLAP = 120
+EMBED_MODEL    = "models/embedding-001"  # 768 dimensions for Gemini
+CHUNK_SIZE     = 800
+CHUNK_OVERLAP  = 120
 
 # Candidate content types
 CONTENT_TYPES = [
@@ -96,14 +101,24 @@ Text sample:
 
 Return only one word from the list above.
 """
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=5,
-        temperature=0
-    )
-    guess = resp.choices[0].message.content.strip().lower()
+    resp = gemini_chat_client.invoke(prompt)
+    guess = resp.content.strip().lower()
     return guess if guess in CONTENT_TYPES else "general"
+
+def generate_keywords(text: str) -> list[str]:
+    """
+    Use LLM to generate 3-4 keywords from the document text.
+    """
+    prompt = f"""
+Generate 3-4 keywords for the following educational document. 
+Return only the keywords, separated by commas.
+
+Text sample:
+{text[:1500]}
+"""
+    resp = gemini_chat_client.invoke(prompt)
+    keywords_str = resp.content.strip()
+    return [kw.strip() for kw in keywords_str.split(',') if kw.strip()]
 
 # -------------------------------------------------------------------
 # API
@@ -112,10 +127,12 @@ app = FastAPI()
 
 @app.post("/ingest")
 async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number: int = Form(0)):
+    logging.info(f"Ingestion started for file: {file.filename}")
     try:
         # 1. Extract text
         data = await file.read()
         ext = os.path.splitext(file.filename)[1].lower()
+        logging.info(f"Extracting text from {file.filename} with extension {ext}")
         if ext == ".pdf":
             text = pdf_to_text(data)
         elif ext == ".docx":
@@ -125,30 +142,42 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
         else:
             text = plain_to_text(data)
         text = normalize_text(text)
+        logging.info(f"Text extracted and normalized. Length: {len(text)}")
 
         # 2. Chunk
         chunks = chunk_text(text)
         if not chunks:
+            logging.warning(f"No text extracted for file: {file.filename}")
             return JSONResponse({"status":"error","msg":"no text extracted"}, status_code=400)
+        logging.info(f"Text chunked into {len(chunks)} chunks.")
 
         # 3. Classify content_type
         content_type = classify_content_type(text, file.filename)
+        logging.info(f"Content type classified as: {content_type}")
 
-        # 4. Embeddings
-        embeddings = client.embeddings.create(
-            model=EMBED_MODEL, input=chunks
-        ).data
+        # 4. Generate keywords
+        keywords = generate_keywords(text)
+        logging.info(f"Keywords generated: {keywords}")
 
-        # 5. Build rows
+        # 5. Embeddings (batch call)
+        emb_resp = gemini_client.embed_documents(
+            texts=chunks
+        )
+        embeddings = emb_resp
+        logging.info(f"Embeddings generated for {len(embeddings)} chunks.")
+
+        # 6. Build rows
         rows = []
         for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            digest = sha1_hex(chunk)
-            unique_id = f"{file.filename}__{i}__{digest[:8]}"
+            # digest = sha1_hex(chunk)
+            # unique_id = f"{file.filename}__{i}__{digest[:8]}"
+            unique_id = file.filename # Use full filename as unique ID
             metadata = {
                 "file_name": file.filename,
                 "course_code": course_code,
                 "unit_number": unit_number,
                 "content_type": content_type,
+                "keywords": keywords, # Add generated keywords
                 "is_chunk": True,
                 "chunk_number": i,
                 "total_chunks": len(chunks),
@@ -156,16 +185,26 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
             rows.append({
                 "unique_id": unique_id,
                 "content": chunk,
-                "embedding": "[" + ",".join(str(x) for x in emb.embedding) + "]",
-                "metadata": metadata,
+                "embedding": emb,       # ✅ raw list of floats
+                "metadata": metadata,   # ✅ stored as JSONB
             })
-        # 6. Insert into Supabase
+        logging.info(f"Prepared {len(rows)} rows for database insertion.")
+
+        # 7. Insert into Supabase
         try:
             res = supabase.table("mcv4u_documents").upsert(
                 rows, on_conflict="unique_id"
             ).execute()
-            return {"status": "success", "inserted": len(rows), "content_type": content_type, "response": res.data}
+            logging.info(f"Successfully inserted {len(rows)} rows into Supabase.")
+            return {
+                "status": "success",
+                "inserted": len(rows),
+                "content_type": content_type,
+                "keywords": keywords, # Also return keywords in response
+                "response": res.data
+            }
         except Exception as db_err:
+            logging.error(f"Database insertion error for file {file.filename}: {db_err}", exc_info=True)
             import traceback
             return JSONResponse({
                 "status": "error",
@@ -174,4 +213,5 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
             }, status_code=500)
 
     except Exception as e:
+        logging.error(f"An unexpected error occurred during ingestion for file {file.filename}: {e}", exc_info=True)
         return JSONResponse({"status":"error","msg":str(e)}, status_code=500)
