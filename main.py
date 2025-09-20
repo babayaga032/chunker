@@ -156,7 +156,7 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
             rows.append({
                 "unique_id": unique_id,
                 "content": chunk,
-                "embedding": emb.embedding,
+                "embedding": str(emb.embedding).replace("[", "{").replace("]", "}"),
                 "metadata": metadata,
             })
         # 6. Insert into Supabase
