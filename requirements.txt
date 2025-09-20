@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai==1.*
+supabase
+tiktoken
+PyMuPDF
+python-docx
+pandas
