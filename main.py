@@ -12,7 +12,8 @@ from supabase import create_client
 import tiktoken
 from docx import Document as DocxDocument
 import pandas as pd
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 # -------------------------------------------------------------------
 # Logging
@@ -23,17 +24,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-gemini_client = GoogleGenerativeAIEmbeddings(
-    model="models/embedding-001", google_api_key=GEMINI_API_KEY
+openai_embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small", 
+    openai_api_key=OPENAI_API_KEY
 )
 gemini_chat_client = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY
 )
 
-EMBED_MODEL = "models/embedding-001"  # 768 dims for Gemini
+EMBED_MODEL = "text-embedding-3-small"  # 1536 dims for OpenAI
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 120
 
@@ -192,7 +195,7 @@ async def ingest_with_meta(file: UploadFile, folder_name: str = Form(...), file_
         # LLM analysis
         analysis = analyze_document_with_llm(text, file.filename, folder_name, file_name)
         # Embeddings
-        embeddings = gemini_client.embed_documents(texts=chunks)
+        embeddings = openai_embeddings.embed_documents(texts=chunks)
         logging.info(f"Embeddings generated for {len(embeddings)} chunks.")
 
         # Build rows
