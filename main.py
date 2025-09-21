@@ -131,10 +131,20 @@ Text sample (first 800 chars):
 Respond ONLY with valid JSON, nothing else.
 """
 
+    
+    
+    parsed = json.loads(raw)
+
     resp = gemini_chat_client.invoke(prompt)
     raw = resp.content.strip()
     logging.info(f"Raw LLM response: {raw}")
-
+    # Remove ```json ... ``` or ''' ... ''' wrappers
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = re.sub(r"^json", "", raw, flags=re.IGNORECASE).strip()
+    if raw.startswith("'''") and raw.endswith("'''"):
+        raw = raw[3:-3].strip()
+    
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
