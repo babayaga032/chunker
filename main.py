@@ -213,7 +213,7 @@ async def ingest_with_meta(file: UploadFile, folder_name: str = Form(...), file_
                 "unique_id": unique_id,
                 "content": chunk,
                 "embedding": emb,                # emb is already the vector
-                "metadata": json.dumps(metadata) # store JSONB
+                "metadata": metadata # store JSONB
             })
 
         # Insert
