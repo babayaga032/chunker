@@ -107,8 +107,8 @@ Return a JSON object with exactly these fields:
 - "unit_number": derive from file_name → integer only (0 if not found)
 - "keywords": array of 3-4 short keywords
 
-Folder name: {folder_name}
-File name: {file_name}
+Folder name: {folder_name} in the folder name course code is always there 
+File name: {file_name}  the file name will always tell about unit number
 Text sample (first 800 chars):
 {text[:800]}
 
