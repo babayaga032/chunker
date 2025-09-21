@@ -191,10 +191,9 @@ async def ingest_with_meta(file: UploadFile, folder_name: str = Form(...), file_
 
         # LLM analysis
         analysis = analyze_document_with_llm(text, file.filename, folder_name, file_name)
-
         # Embeddings
         embeddings = gemini_client.embed_documents(texts=chunks)
-        embeddings = [e["embedding"] for e in embeddings]
+        logging.info(f"Embeddings generated for {len(embeddings)} chunks.")
 
         # Build rows
         rows = []
@@ -213,8 +212,8 @@ async def ingest_with_meta(file: UploadFile, folder_name: str = Form(...), file_
             rows.append({
                 "unique_id": unique_id,
                 "content": chunk,
-                "embedding": emb,
-                "metadata": json.dumps(metadata)  # store JSONB cleanly
+                "embedding": emb,                # emb is already the vector
+                "metadata": json.dumps(metadata) # store JSONB
             })
 
         # Insert
