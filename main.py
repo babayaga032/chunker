@@ -130,6 +130,11 @@ def analyze_document_with_llm(text: str, filename: str, folder_name: str = None,
 
     try:
         parsed = json.loads(raw)
+
+        # handle list-wrapped response
+        if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+
     except Exception:
         logging.warning("Invalid JSON from LLM, using defaults")
         parsed = {
@@ -152,6 +157,7 @@ def analyze_document_with_llm(text: str, filename: str, folder_name: str = None,
         parsed["keywords"] = []
 
     return parsed
+
 
 # -------------------------------------------------------------------
 # API
