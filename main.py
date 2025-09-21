@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API: Upload file → Extract → Chunk → LLM classify content_type → Embed (1536-d) → Insert into Supabase
+API: Upload file → Extract → Chunk → LLM classify content_type + course_code + unit_number + keywords → Embed → Insert into Supabase
 """
 
-import os, io, re, uuid, hashlib
+import os, io, re, uuid, hashlib, json, logging
 import fitz  # PyMuPDF for PDF
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile
 from fastapi.responses import JSONResponse
 from supabase import create_client
 import tiktoken
@@ -14,29 +14,33 @@ from docx import Document as DocxDocument
 import pandas as pd
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
-import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # -------------------------------------------------------------------
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-gemini_client = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
-gemini_chat_client = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY)
 
-EMBED_MODEL    = "models/embedding-001"  # 768 dimensions for Gemini
-CHUNK_SIZE     = 800
-CHUNK_OVERLAP  = 120
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+gemini_client = GoogleGenerativeAIEmbeddings(
+    model="models/embedding-001", google_api_key=GEMINI_API_KEY
+)
+gemini_chat_client = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY
+)
+
+EMBED_MODEL = "models/embedding-001"  # 768 dims for Gemini
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 120
 
 # Candidate content types
 CONTENT_TYPES = [
-    "lesson","assessment","exam","assignment","homework",
-    "practice","solutions","answers","notes","rubric","worksheet",
-    "textbook","course_mapping","curriculum","course_outline","general"
+    "lesson", "assessment", "exam", "assignment", "homework",
+    "practice", "solutions", "answers", "notes", "rubric", "worksheet",
+    "textbook", "course_mapping", "curriculum", "course_outline", "general"
 ]
 
 # -------------------------------------------------------------------
@@ -72,7 +76,7 @@ def csv_xlsx_to_text(b: bytes, ext: str) -> str:
             df = pd.read_excel(f, dtype=str).fillna("")
     lines = [
         "| " + " | ".join(df.columns) + " |",
-        "| " + " | ".join(["---"]*len(df.columns)) + " |"
+        "| " + " | ".join(["---"] * len(df.columns)) + " |",
     ]
     for _, row in df.iterrows():
         lines.append("| " + " | ".join(str(x) for x in row) + " |")
@@ -83,42 +87,59 @@ def chunk_text(text: str) -> list[str]:
     toks = enc.encode(text)
     chunks, step = [], CHUNK_SIZE - CHUNK_OVERLAP
     for start in range(0, len(toks), step):
-        piece = toks[start:start+CHUNK_SIZE]
+        piece = toks[start : start + CHUNK_SIZE]
         chunks.append(enc.decode(piece))
     return [c.strip() for c in chunks if c.strip()]
 
-def classify_content_type(text: str, filename: str) -> str:
+def analyze_document_with_llm(text: str, filename: str) -> dict:
     """
-    Use LLM to classify file into one of the predefined CONTENT_TYPES.
+    Ask Gemini to classify content_type, detect course_code + unit_number,
+    and generate keywords. Must return valid JSON.
     """
     prompt = f"""
-Classify this educational file into one category only:
-{", ".join(CONTENT_TYPES)}
+You are analyzing an educational document. 
+Return a JSON object with exactly these fields:
 
-File name: {filename}
-Text sample:
+- "content_type": one of {CONTENT_TYPES}
+- "course_code": always ALL CAPS string (return "GENERAL" if not found)
+- "unit_number": integer only (0 if not found)
+- "keywords": array of 3-4 short keywords
+
+Filename: {filename}
+Text sample (first 800 chars):
 {text[:800]}
 
-Return only one word from the list above.
+Respond ONLY with valid JSON, nothing else.
 """
-    resp = gemini_chat_client.invoke(prompt)
-    guess = resp.content.strip().lower()
-    return guess if guess in CONTENT_TYPES else "general"
 
-def generate_keywords(text: str) -> list[str]:
-    """
-    Use LLM to generate 3-4 keywords from the document text.
-    """
-    prompt = f"""
-Generate 3-4 keywords for the following educational document. 
-Return only the keywords, separated by commas.
-
-Text sample:
-{text[:1500]}
-"""
     resp = gemini_chat_client.invoke(prompt)
-    keywords_str = resp.content.strip()
-    return [kw.strip() for kw in keywords_str.split(',') if kw.strip()]
+    raw = resp.content.strip()
+    logging.info(f"Raw LLM response: {raw}")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.warning("LLM did not return valid JSON. Falling back to defaults.")
+        parsed = {
+            "content_type": "general",
+            "course_code": "GENERAL",
+            "unit_number": 0,
+            "keywords": [],
+        }
+
+    # Normalize
+    parsed["content_type"] = parsed.get("content_type", "general").lower()
+    if parsed["content_type"] not in CONTENT_TYPES:
+        parsed["content_type"] = "general"
+    parsed["course_code"] = parsed.get("course_code", "GENERAL").upper()
+    try:
+        parsed["unit_number"] = int(parsed.get("unit_number", 0))
+    except Exception:
+        parsed["unit_number"] = 0
+    if not isinstance(parsed.get("keywords"), list):
+        parsed["keywords"] = []
+
+    return parsed
 
 # -------------------------------------------------------------------
 # API
@@ -126,7 +147,7 @@ Text sample:
 app = FastAPI()
 
 @app.post("/ingest")
-async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number: int = Form(0)):
+async def ingest(file: UploadFile):
     logging.info(f"Ingestion started for file: {file.filename}")
     try:
         # 1. Extract text
@@ -148,25 +169,27 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
         chunks = chunk_text(text)
         if not chunks:
             logging.warning(f"No text extracted for file: {file.filename}")
-            return JSONResponse({"status":"error","msg":"no text extracted"}, status_code=400)
+            return JSONResponse(
+                {"status": "error", "msg": "no text extracted"}, status_code=400
+            )
         logging.info(f"Text chunked into {len(chunks)} chunks.")
 
-        # 3. Classify content_type
-        content_type = classify_content_type(text, file.filename)
-        logging.info(f"Content type classified as: {content_type}")
-
-        # 4. Generate keywords
-        keywords = generate_keywords(text)
-        logging.info(f"Keywords generated: {keywords}")
-
-        # 5. Embeddings (batch call)
-        emb_resp = gemini_client.embed_documents(
-            texts=chunks
+        # 3. LLM analysis (content_type + course_code + unit_number + keywords)
+        analysis = analyze_document_with_llm(text, file.filename)
+        content_type = analysis["content_type"]
+        course_code = analysis["course_code"]
+        unit_number = analysis["unit_number"]
+        keywords = analysis["keywords"]
+        logging.info(
+            f"LLM analysis: type={content_type}, course={course_code}, unit={unit_number}, keywords={keywords}"
         )
+
+        # 4. Embeddings
+        emb_resp = gemini_client.embed_documents(texts=chunks)
         embeddings = emb_resp
         logging.info(f"Embeddings generated for {len(embeddings)} chunks.")
 
-        # 6. Build rows
+        # 5. Build rows
         rows = []
         for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
             digest = sha1_hex(chunk)
@@ -176,20 +199,22 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
                 "course_code": course_code,
                 "unit_number": unit_number,
                 "content_type": content_type,
-                "keywords": keywords, # Add generated keywords
+                "keywords": keywords,
                 "is_chunk": True,
                 "chunk_number": i,
                 "total_chunks": len(chunks),
             }
-            rows.append({
-                "unique_id": unique_id,
-                "content": chunk,
-                "embedding": emb,       # ✅ raw list of floats
-                "metadata": metadata,   # ✅ stored as JSONB
-            })
+            rows.append(
+                {
+                    "unique_id": unique_id,
+                    "content": chunk,
+                    "embedding": emb,
+                    "metadata": metadata,
+                }
+            )
         logging.info(f"Prepared {len(rows)} rows for database insertion.")
 
-        # 7. Insert into Supabase
+        # 6. Insert into Supabase
         try:
             res = supabase.table("mcv4u_documents").upsert(
                 rows, on_conflict="unique_id"
@@ -198,19 +223,24 @@ async def ingest(file: UploadFile, course_code: str = Form("MCV4U"), unit_number
             return {
                 "status": "success",
                 "inserted": len(rows),
-                "content_type": content_type,
-                "keywords": keywords, # Also return keywords in response
-                "response": res.data
+                "analysis": analysis,
+                "response": res.data,
             }
         except Exception as db_err:
-            logging.error(f"Database insertion error for file {file.filename}: {db_err}", exc_info=True)
+            logging.error(
+                f"Database insertion error for file {file.filename}: {db_err}",
+                exc_info=True,
+            )
             import traceback
-            return JSONResponse({
-                "status": "error",
-                "msg": str(db_err),
-                "trace": traceback.format_exc()
-            }, status_code=500)
+
+            return JSONResponse(
+                {"status": "error", "msg": str(db_err), "trace": traceback.format_exc()},
+                status_code=500,
+            )
 
     except Exception as e:
-        logging.error(f"An unexpected error occurred during ingestion for file {file.filename}: {e}", exc_info=True)
-        return JSONResponse({"status":"error","msg":str(e)}, status_code=500)
+        logging.error(
+            f"An unexpected error occurred during ingestion for file {file.filename}: {e}",
+            exc_info=True,
+        )
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
