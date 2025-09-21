@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API: Upload file → Extract → Chunk → LLM classify content_type + course_code + unit_number + keywords → Embed → Insert into Supabase
+API: Upload file → Extract → Chunk → LLM classify 
+(content_type + course_code + unit_number + keywords) → Embed → Insert into Supabase
 """
 
 import os, io, re, uuid, hashlib, json, logging
 import fitz  # PyMuPDF for PDF
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
 from supabase import create_client
 import tiktoken
@@ -91,12 +92,30 @@ def chunk_text(text: str) -> list[str]:
         chunks.append(enc.decode(piece))
     return [c.strip() for c in chunks if c.strip()]
 
-def analyze_document_with_llm(text: str, filename: str) -> dict:
+def analyze_document_with_llm(text: str, filename: str, folder_name: str = None, file_name: str = None) -> dict:
     """
     Ask Gemini to classify content_type, detect course_code + unit_number,
     and generate keywords. Must return valid JSON.
     """
-    prompt = f"""
+    if folder_name and file_name:
+        prompt = f"""
+You are analyzing an educational document. 
+Return a JSON object with exactly these fields:
+
+- "content_type": one of {CONTENT_TYPES}
+- "course_code": derive from folder_name → return ALL CAPS
+- "unit_number": derive from file_name → integer only (0 if not found)
+- "keywords": array of 3-4 short keywords
+
+Folder name: {folder_name}
+File name: {file_name}
+Text sample (first 800 chars):
+{text[:800]}
+
+Respond ONLY with valid JSON, nothing else.
+"""
+    else:
+        prompt = f"""
 You are analyzing an educational document. 
 Return a JSON object with exactly these fields:
 
@@ -122,7 +141,7 @@ Respond ONLY with valid JSON, nothing else.
         logging.warning("LLM did not return valid JSON. Falling back to defaults.")
         parsed = {
             "content_type": "general",
-            "course_code": "GENERAL",
+            "course_code": folder_name.upper() if folder_name else "GENERAL",
             "unit_number": 0,
             "keywords": [],
         }
@@ -146,14 +165,16 @@ Respond ONLY with valid JSON, nothing else.
 
 app = FastAPI()
 
-@app.post("/ingest")
-async def ingest(file: UploadFile):
-    logging.info(f"Ingestion started for file: {file.filename}")
+@app.post("/ingest_with_meta")
+async def ingest_with_meta(file: UploadFile, folder_name: str = Form(...), file_name: str = Form(...)):
+    """
+    New endpoint: explicitly pass folder_name (course_code source) and file_name (unit_number source)
+    """
+    logging.info(f"Ingestion started for file: {file.filename} (folder={folder_name}, file_name={file_name})")
     try:
-        # 1. Extract text
+        # Extract text
         data = await file.read()
         ext = os.path.splitext(file.filename)[1].lower()
-        logging.info(f"Extracting text from {file.filename} with extension {ext}")
         if ext == ".pdf":
             text = pdf_to_text(data)
         elif ext == ".docx":
@@ -163,84 +184,36 @@ async def ingest(file: UploadFile):
         else:
             text = plain_to_text(data)
         text = normalize_text(text)
-        logging.info(f"Text extracted and normalized. Length: {len(text)}")
 
-        # 2. Chunk
+        # Chunk
         chunks = chunk_text(text)
         if not chunks:
-            logging.warning(f"No text extracted for file: {file.filename}")
-            return JSONResponse(
-                {"status": "error", "msg": "no text extracted"}, status_code=400
-            )
-        logging.info(f"Text chunked into {len(chunks)} chunks.")
+            return JSONResponse({"status": "error", "msg": "no text extracted"}, status_code=400)
 
-        # 3. LLM analysis (content_type + course_code + unit_number + keywords)
-        analysis = analyze_document_with_llm(text, file.filename)
-        content_type = analysis["content_type"]
-        course_code = analysis["course_code"]
-        unit_number = analysis["unit_number"]
-        keywords = analysis["keywords"]
-        logging.info(
-            f"LLM analysis: type={content_type}, course={course_code}, unit={unit_number}, keywords={keywords}"
-        )
+        # LLM analysis
+        analysis = analyze_document_with_llm(text, file.filename, folder_name, file_name)
 
-        # 4. Embeddings
-        emb_resp = gemini_client.embed_documents(texts=chunks)
-        embeddings = emb_resp
-        logging.info(f"Embeddings generated for {len(embeddings)} chunks.")
+        # Embeddings
+        embeddings = gemini_client.embed_documents(texts=chunks)
 
-        # 5. Build rows
+        # Build rows
         rows = []
         for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
             digest = sha1_hex(chunk)
             unique_id = f"{file.filename}__{i}__{digest[:8]}"
-            metadata = {
-                "file_name": file.filename,
-                "course_code": course_code,
-                "unit_number": unit_number,
-                "content_type": content_type,
-                "keywords": keywords,
-                "is_chunk": True,
-                "chunk_number": i,
-                "total_chunks": len(chunks),
-            }
-            rows.append(
-                {
-                    "unique_id": unique_id,
-                    "content": chunk,
-                    "embedding": emb,
-                    "metadata": metadata,
-                }
-            )
-        logging.info(f"Prepared {len(rows)} rows for database insertion.")
+            metadata = {**analysis,
+                        "file_name": file.filename,
+                        "folder_name": folder_name,
+                        "original_file_name": file_name,
+                        "is_chunk": True,
+                        "chunk_number": i,
+                        "total_chunks": len(chunks)}
+            rows.append({"unique_id": unique_id, "content": chunk, "embedding": emb, "metadata": metadata})
 
-        # 6. Insert into Supabase
-        try:
-            res = supabase.table("mcv4u_documents").upsert(
-                rows, on_conflict="unique_id"
-            ).execute()
-            logging.info(f"Successfully inserted {len(rows)} rows into Supabase.")
-            return {
-                "status": "success",
-                "inserted": len(rows),
-                "analysis": analysis,
-                "response": res.data,
-            }
-        except Exception as db_err:
-            logging.error(
-                f"Database insertion error for file {file.filename}: {db_err}",
-                exc_info=True,
-            )
-            import traceback
-
-            return JSONResponse(
-                {"status": "error", "msg": str(db_err), "trace": traceback.format_exc()},
-                status_code=500,
-            )
+        # Insert
+        res = supabase.table("mcv4u_documents").upsert(rows, on_conflict="unique_id").execute()
+        return {"status": "success", "inserted": len(rows), "analysis": analysis, "response": res.data}
 
     except Exception as e:
-        logging.error(
-            f"An unexpected error occurred during ingestion for file {file.filename}: {e}",
-            exc_info=True,
-        )
+        logging.error(f"Error in /ingest_with_meta: {e}", exc_info=True)
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
