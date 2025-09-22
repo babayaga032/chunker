@@ -3,8 +3,8 @@
 """
 API: Upload file → Extract → Chunk → LLM classify (content_type + course_code + unit_number + keywords) → Embed → Insert into Supabase
 """
-
-import os, io, re, uuid, hashlib, json, logging
+import os
+import io, re, uuid, hashlib, json, logging
 import fitz  # PyMuPDF for PDF
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
