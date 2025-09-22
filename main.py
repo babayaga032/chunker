@@ -101,11 +101,11 @@ def analyze_document_with_llm(text: str, filename: str, folder_name: str = None,
     prompt = f"""
     You are analyzing an educational document. Return a JSON object with exactly these fields:
     - "content_type": one of {CONTENT_TYPES}
-    - "course_code": derive from folder_name → return ALL CAPS
+    - "course_code": derive from file_name → return ALL CAPS
     - "unit_number": derive from file_name → integer only (0 if not found)
     - "keywords": array of 3-4 short keywords
 
-    Folder name: {folder_name}
+    
     File name: {file_name}
     Text sample (first 800 chars): {text[:800]}
 
